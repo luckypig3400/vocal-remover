@@ -22,20 +22,25 @@ class Separator(object):
         self.cropsize = cropsize
         self.postprocess = postprocess
 
-    def _separate(self, X_mag_pad, roi_size):
+    def _separate(self, X_arr_pad, roi_size):
         self.model.eval()
         with torch.no_grad():
             mask = []
-            patches = (X_mag_pad.shape[2] - 2 * self.offset) // roi_size
+            patches = (X_arr_pad.shape[2] - 2 * self.offset) // roi_size
             for i in tqdm(range(patches)):
                 start = i * roi_size
-                X_mag_crop = X_mag_pad[None, :, :, start:start + self.cropsize]
-                X_mag_crop = torch.from_numpy(X_mag_crop).to(self.device)
+                X_arr_crop = X_arr_pad[None, :, :, start:start + self.cropsize]
+                X_arr_crop = torch.from_numpy(X_arr_crop).to(self.device)
 
-                pred = self.model.predict_mask(X_mag_crop)
+                pred_mag, pred_phase = self.model.predict_mask(X_arr_crop)
 
-                pred = pred.detach().cpu().numpy()
-                mask.append(pred[0])
+                if self.model.predict_phase:
+                    pred_mag = pred_mag.detach().cpu().numpy()
+                    pred_phase = pred_phase.detach().cpu().numpy()
+                    mask.append(np.concatenate([pred_mag[0], pred_phase[0]]))
+                else:
+                    pred_mag = pred_mag.detach().cpu().numpy()
+                    mask.append(pred_mag[0])
 
             mask = np.concatenate(mask, axis=2)
 
@@ -48,26 +53,35 @@ class Separator(object):
         return X_mag, X_phase
 
     def _postprocess(self, mask, X_mag, X_phase):
-        if self.postprocess:
-            mask = spec_utils.merge_artifacts(mask)
+        mask_mag = mask[:2]
+        mask_phase = mask[2:]
 
-        return mask * X_mag * np.exp(1.j * X_phase)
+        if self.postprocess:
+            mask_mag = spec_utils.merge_artifacts(mask_mag)
+
+        if self.model.predict_phase:
+            y_spec = mask_mag * X_mag * np.exp(1.j * X_phase * mask_phase)
+            v_spec = (1 - mask_mag) * X_mag * np.exp(1.j * X_phase)
+        else:
+            y_spec = mask_mag * X_mag * np.exp(1.j * X_phase)
+            v_spec = (1 - mask_mag) * X_mag * np.exp(1.j * X_phase)
+
+        return y_spec, v_spec
 
     def separate(self, X_spec):
         X_mag, X_phase = self._preprocess(X_spec)
 
         coef = X_mag.max()
-        X_mag_pre = X_mag / coef
+        X_arr = np.concatenate([X_mag / coef, X_phase])
 
-        n_frame = X_mag_pre.shape[2]
+        n_frame = X_arr.shape[2]
         pad_l, pad_r, roi_size = dataset.make_padding(n_frame, self.cropsize, self.offset)
-        X_mag_pad = np.pad(X_mag_pre, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
+        X_arr_pad = np.pad(X_arr, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
 
-        mask = self._separate(X_mag_pad, roi_size)
-        mask = mask[:, :, :n_frame]
+        mask = self._separate(X_arr_pad, roi_size)
+        mask = mask[:, :, : n_frame]
 
-        y_spec = self._postprocess(mask, X_mag, X_phase)
-        v_spec = X_spec - y_spec
+        y_spec, v_spec = self._postprocess(mask, X_mag, X_phase)
 
         return y_spec, v_spec
 
@@ -75,24 +89,23 @@ class Separator(object):
         X_mag, X_phase = self._preprocess(X_spec)
 
         coef = X_mag.max()
-        X_mag_pre = X_mag / coef
+        X_arr = np.concatenate([X_mag / coef, X_phase])
 
-        n_frame = X_mag_pre.shape[2]
+        n_frame = X_arr.shape[2]
         pad_l, pad_r, roi_size = dataset.make_padding(n_frame, self.cropsize, self.offset)
-        X_mag_pad = np.pad(X_mag_pre, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
+        X_arr_pad = np.pad(X_arr, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
 
-        mask = self._separate(X_mag_pad, roi_size)
+        mask = self._separate(X_arr_pad, roi_size)
 
         pad_l += roi_size // 2
         pad_r += roi_size // 2
-        X_mag_pad = np.pad(X_mag_pre, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
+        X_arr_pad = np.pad(X_arr, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
 
-        mask_tta = self._separate(X_mag_pad, roi_size)
+        mask_tta = self._separate(X_arr_pad, roi_size)
         mask_tta = mask_tta[:, :, roi_size // 2:]
         mask = (mask[:, :, :n_frame] + mask_tta[:, :, :n_frame]) * 0.5
 
-        y_spec = self._postprocess(mask, X_mag, X_phase)
-        v_spec = X_spec - y_spec
+        y_spec, v_spec = self._postprocess(mask, X_mag, X_phase)
 
         return y_spec, v_spec
 
@@ -113,7 +126,7 @@ def main():
 
     print('loading model...', end=' ')
     device = torch.device('cpu')
-    model = nets.CascadedNet(args.n_fft)
+    model = nets.CascadedNet(args.n_fft, predict_mag=True, predict_phase=True)
     model.load_state_dict(torch.load(args.pretrained_model, map_location=device))
     if torch.cuda.is_available() and args.gpu >= 0:
         device = torch.device('cuda:{}'.format(args.gpu))
